@@ -1,0 +1,39 @@
+name: taskline
+
+services:
+  valkey:
+    image: docker.io/valkey/valkey:8-alpine
+    # Append-only file, flushed every second, so queued messages survive a restart.
+    command: ["valkey-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "127.0.0.1:${TASKLINE_VALKEY_PORT:-6380}:6379"
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Only for running or testing taskline on its own: start with --profile standalone.
+  # When a host application provides the database, leave this service off.
+  postgres:
+    profiles: [standalone]
+    image: docker.io/library/postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${TASKLINE_POSTGRES_USER:-taskline}
+      POSTGRES_PASSWORD: ${TASKLINE_POSTGRES_PASSWORD:-taskline}
+      POSTGRES_DB: ${TASKLINE_POSTGRES_DB:-taskline}
+    ports:
+      - "127.0.0.1:${TASKLINE_POSTGRES_PORT:-5435}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TASKLINE_POSTGRES_USER:-taskline} -d ${TASKLINE_POSTGRES_DB:-taskline}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  valkey-data:
+  postgres-data:

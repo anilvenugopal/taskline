@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "taskline"
+version = "0.1.0"
+description = "Task execution engine on taskiq: chains, lifecycle hooks, leased heartbeats, lineage tracking in Postgres."
+requires-python = ">=3.14"
+dependencies = [
+    "taskiq",
+    "taskiq-redis",
+    "taskiq-pipelines",
+    "redis",
+    "sqlalchemy[asyncio]>=2.0",
+    "psycopg[binary]>=3.2",
+    "pydantic-settings",
+]
+
+[project.scripts]
+taskline = "taskline.__main__:main"
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/taskline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
