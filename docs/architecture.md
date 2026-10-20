@@ -6,7 +6,7 @@ Read this first. Every other document and every line of code should be explainab
 
 Taskline runs background work for an application. The application hands taskline a job: one task, or an ordered chain of tasks. Taskline sends each task to a worker, watches the worker while it runs, retries it if it fails, takes it back if the worker dies, and records everything that happened in a database so a person can look at it afterwards.
 
-Taskline is a product in its own right. It lives in `packages/taskline/`, imports nothing from the application that uses it, and could be copied into another repository unchanged.
+Taskline is a product in its own right. It lives in its own repository, `anilvenugopal/taskline`, imports nothing from the applications that use it, and has no user interface. Other packages use it only through its public contract (section 11.2).
 
 Taskline is built on **taskiq**, an open-source Python task queue library. Taskiq provides the parts that are hard to get right and are not our business: sending messages through a queue, workers that receive them, and a plug-in point (called a middleware) that lets us run our own code before and after every task. Taskline adds what taskiq does not have: a durable record of every task, leased heartbeats, recovery of lost work, and a clear history of each chain.
 
@@ -36,8 +36,8 @@ These words have one meaning throughout taskline's documents, tables and code.
 | **Postgres, schema `jobs`** | The record of every run, task and event | The application's Postgres | The single source of truth. If Valkey is wiped, Postgres still knows what was supposed to happen |
 | **Reaper** | A small separate process that checks Postgres for work that has gone wrong | `taskline reaper` | Takes back tasks from dead workers, sends due retries, fails lost hand-offs, and reports queues that look wrong. It never touches a queued task |
 | **Scheduler** | A process that fires schedules stored in Postgres | `taskline scheduler` | Starts jobs at their cron or interval times, once each, even if two schedulers run |
-| **Command line** | `taskline migrate`, `worker`, `reaper`, `scheduler`, `schedules`, `runs`, `show`, `cancel` | A terminal | Operating and inspecting the system |
-| **Admin UI** | A web page over the `jobs` schema | Later step | Lets people see runs, step status, heartbeats and event logs, and cancel or retry |
+| **Command line** | `taskline migrate`, `worker`, `reaper`, `queues`, `runs`, `show`, `cancel`, `retry`, `requeue`, and later `scheduler` and `schedules` | A terminal | Operating and inspecting the system. It calls the command functions and reads through the views |
+| **Taskline UI** | A separate package, not part of Taskline, built on Lattice | Inside a Lattice host | Shows runs, steps, workers and queues from the views, and calls the command functions. Taskline never imports it |
 
 ## 3. How the pieces connect
 
@@ -92,7 +92,7 @@ Version 1 supports tasks run in sequence only. The library also offers map and f
 
 ### 5.1 Scheduled runs
 
-A schedule says "run this job at these times". The job can be one task or several tasks in order. A schedule is data in Postgres, not code, so people can create, pause, resume and delete schedules from the command line or the admin UI without a deployment.
+A schedule says "run this job at these times". The job can be one task or several tasks in order. A schedule is data in Postgres, not code, so people can create, pause, resume and delete schedules from the command line or the command functions (section 11.3) without a deployment.
 
 - **What a schedule holds:** a name, the job to run, the arguments, a cron expression or a fixed interval, a time zone, an optional start time and end time, enabled or paused, the **producer** and **references** every run it creates will carry (so scheduled runs are never anonymous), and two policies described below.
 - **Start and end times.** A schedule can be entered ahead of time. Nothing fires before its start time, and nothing fires at or after its end time, so deploying at 3 pm for a midnight start needs no action at midnight, and a schedule with an end time stops on its own. The first run is the first scheduled time at or after the start time. An interval schedule counts its intervals from the start time, or from when it was created if there is none. Times before the start are never counted as missed. Whether a schedule has ended is worked out from its end time; no flag is changed.
@@ -133,6 +133,25 @@ Mapped values are checked against the task function's type hints when the task s
 
 A job's tasks are fixed when the job is submitted. When what comes next depends on a result, the task submits a new job. The new job records the submitting task as its parent and inherits its producer and correlation id, so related work can be found by one id. A task that finds many items, such as 200 documents, can submit one job for each, and each has its own history, retries and cancel. The submitting job's run can end `succeeded` while the jobs it started are still running, so the whole flow is seen through the correlation id or the parent links. Listing every possible task in the job and letting the unneeded ones end quickly also works, but a task that does nothing is recorded as `succeeded`, so it is not recommended.
 
+### 5.4 The job catalogue and typed inputs
+
+A job's inputs can be declared in two ways. As names only, as in section 5.2, they are untyped. Or as a Pydantic model, a small class that lists each input with its type, whether it is required, its default and a description:
+
+```python
+class IngestInputs(BaseModel):
+    url: str
+    project_id: int = Field(description="The project to file the document under")
+
+INGEST_DOCUMENT = Job("ingest_document", inputs=IngestInputs, description="...", steps=[...])
+catalogue.register(INGEST_DOCUMENT)
+```
+
+The model gives the job its input names, validates a submission (each wrong input is named), and produces the JSON Schema that a UI draws its form from. The values still travel as JSON, so they are dumped with `model_dump(mode="json")`. Types are declared on the job, not read from the task functions, because submitters import `TaskSpec`s and never the task code. A mismatch between the job's types and a task's type hints is still caught when the task starts, as in section 5.2.
+
+The **catalogue** is the process's list of jobs by name. A job is added to it by an explicit `catalogue.register(job)` at the end of the module that defines it. A job is looked up by name for `submit_job`, and `list_jobs()` describes every registered job: name, description, steps (task names and queues), required reference kinds and the input JSON Schema.
+
+Modules that define task specs and jobs, and nothing else, are the **definition modules**. They import no task implementation, so a web process can load them without the code that parses documents. They are named in `TASKLINE_CATALOGUE_MODULES` and loaded by `load_catalogue()`. The modules in `TASKLINE_JOB_MODULES`, which hold the task implementations, are still loaded only by workers.
+
 ## 6. Heartbeats and leases in plain words
 
 A **lease** is a promise with an expiry: "this worker owns this task until time T, and will renew before T." The worker's heartbeat renews it. If the worker dies, hangs, or loses its network, the renewals stop and the lease runs out. The reaper then sees an expired lease and acts.
@@ -158,7 +177,7 @@ Capacity has three layers:
 
 The tasks running at once on a queue are the number of worker processes times the concurrency. Ending a worker process affects every task in it, which is why a task with a cancel grace period requires concurrency one.
 
-Taskline does not start or stop workers. It reports, per queue, the tasks waiting, the tasks running, the age of the oldest waiting task and the live workers, in the command line and the admin UI. Whatever runs your workers (podman compose, systemd, Kubernetes, a script) uses those numbers to scale.
+Taskline does not start or stop workers. It reports, per queue, the tasks waiting, the tasks running, the age of the oldest waiting task and the live workers, in the command line and the `queue` view. Whatever runs your workers (podman compose, systemd, Kubernetes, a script) uses those numbers to scale.
 
 ### 6.2 Cancelling a running task
 
@@ -229,6 +248,7 @@ Any task can read its own identity through `current_lineage()`: run id, task pos
 | `schedule` | schedule definition | name, job, arguments, cron or interval, time zone, start time, end time, enabled, producer, overlap policy, missed-fire policy, who created it |
 | `schedule_reference` | external reference copied onto every run a schedule creates | same shape as `job_reference`, attached to the schedule |
 | `schedule_fire` | time a schedule was due | schedule, intended fire time (unique together), outcome (fired, skipped for overlap, skipped as missed), the run created if any |
+| `instance` | database (one row) | name, the Taskline version that last migrated the database, written by `taskline migrate` |
 | `*_kind` | allowed value | Lookup tables for every status and event type (no database enums, matching the project convention). Two of them are filled by the host application rather than by taskline: `producer_kind` and `reference_kind` (section 10.1) |
 
 ### 10.1 Producer and external references
@@ -241,7 +261,7 @@ A run with no context is litter: someone sees "fetch_source, failed" and cannot 
 
 - a **kind**, registered in `reference_kind`: for example `source`, `ingest_run`, `document`, `project`;
 - an **external id**, which is the host's own id as text (taskline never looks it up);
-- an optional label and link, so the admin UI can show "Zurich 10-K, 2026" and link back to the host's page;
+- an optional label and link, so a UI can show "Zurich 10-K, 2026" and link back to the host's page;
 - a **relation**: `subject` (what the job is about), `produced` (what the job created), or `caused_by` (what triggered it).
 
 References come from two places. The submitter attaches them when submitting. A running task can add more once it knows them: a fetch task attaches `produced: document <id>` for each document it stores. Then you can start from a document and find the run that made it, or start from a source and see every run for it. References are indexed by kind and id so both lookups are fast.
@@ -250,9 +270,33 @@ A task can also declare reference kinds it requires. A submission of a job conta
 
 Taskline does not interpret references. It stores and indexes them. Meaning stays with the host. If the host later deletes the object a reference points to, the reference stays as plain history.
 
-All of it lives in a schema named `jobs`, so it never collides with the host application's tables. Taskline creates it with its own `taskline migrate` command and keeps its own version number in `jobs._schema_version`, so it does not depend on the host's migration tool.
+The tables live in a schema named `jobs`, so they never collide with the host application's tables. That schema is private: only Taskline reads and writes it. What other programs may read is a second schema, `taskline_api`, made of views (section 10.2). Taskline creates both with its own `taskline migrate` command and keeps its own version number in `jobs._schema_version`, so it does not depend on the host's migration tool.
 
 Ids are UUID version 7, which start with the creation time, so rows sort by when they were made and new rows land at the end of the indexes. Taskline's broker generates run and task ids; the database generates the others with `uuidv7()`.
+
+### 10.2 The `taskline_api` views
+
+A view is a stored query that looks like a table. These views are Taskline's published read contract. They give other programs stable names, and they leave Taskline free to change the tables underneath. Columns can be added at any time. Removing or renaming a column is a breaking change and raises the major version.
+
+| View | One row per | Built from |
+|---|---|---|
+| `run` | job run | `job_run`, with the current step, error, progress and attempt totals taken from its tasks |
+| `task` | task instance | `task_instance` |
+| `reference` | reference on a run or one of its tasks | `job_reference`, with the step index from `task_instance` |
+| `event` | task event | `task_event`, with the run id from `task_instance` |
+| `queue` | queue with open tasks or live workers | open `task_instance` rows and live `worker` rows |
+| `worker` | worker or reaper process | `worker`, with host and process id read from the worker id |
+| `instance` | database | `instance` and `_schema_version` |
+
+Rules: timestamps are `timestamptz` in UTC; status values are the closed sets in the contract; the views belong to the migrating role and run with its rights, so a database role granted only `USAGE` on `taskline_api` and `SELECT` on the views reads them without any access to `jobs` (the views must never be created with `security_invoker`). `taskline migrate` takes an optional reader role (setting `TASKLINE_API_READER_ROLE`) and grants it that access. It never creates a role, because roles belong to the whole database server. Views are created in numbered migration files, and a later change is a new file.
+
+The views are indexed for the filters a list needs: status with created time and with finish time, job name, producer, correlation id, schedule, and reference kind with external id and run id. The `event` view orders by an increasing id, which is meant for showing one run's log, not as a cursor for reading new events (ids can become visible out of order).
+
+**The speed of the `run` view.** The columns of `run` that are worked out from a run's tasks (current step, error, progress, attempt totals, start time, duration, cancel requested, parent run) are each their own small subquery in the view, so a column nobody selects is never computed. A page count or a filter on the indexed columns therefore never reads a task. The first design joined the tasks in with `LATERAL`, and counting all runs took 1.2 seconds at a million runs, because Postgres cannot skip a lateral join; the subqueries took 30 milliseconds, and nothing needed to be stored on the run row. The measured costs are in section 13. Two things stay slow, and the public contract says so: filtering or sorting by one of the computed columns reads the tasks of every run, and paging very deep by offset costs about 80 microseconds per skipped row. A small index on running tasks with a cancel waiting keeps the `cancel_requested` column cheap.
+
+Taskline's own command line (`runs`, `show`, `queues`), and the reaper's queue check, read through these views, so they are used every day. After an upgrade, run `taskline migrate` before starting workers or a reaper.
+
+**How another application learns that a run finished.** Taskline publishes no event feed. The application reads `taskline_api.run` on a timer, for example every minute, for runs with the status it cares about that finished within a window (for example the last seven days), and keeps its own record of which run ids it has already handled. Because it asks "what is the state now" and not "what is new since", a row that becomes visible late is found on the next read. The `finished_at` value is set when the run's status changes, using the database clock at the start of that transaction, so a window is needed and not a bare "since the last read". Hooks (section 9) remain for code that runs inside the worker or reaper.
 
 ## 11. The boundary with the host application
 
@@ -262,20 +306,53 @@ What taskline does not know about: the host's tables, settings, domain terms or 
 
 What the host does: declare tasks with taskline's `@task` decorator (name, queue, maximum attempts, timeout, cancel grace period, required reference kinds), define jobs as ordered lists of tasks, register its producers and reference kinds, submit jobs with a producer and references, register hooks, and point taskline at its modules through configuration.
 
-In this repository, the StrategIQ application owns the Postgres container and hosts the `jobs` schema in its database. Taskline's own folder holds taskline's own `.env.example`, container file (Valkey, plus an optional Postgres for running taskline on its own) and docs.
+Taskline is developed and released from its own repository, with its own `.env.example`, container file (Valkey, plus an optional Postgres for running it standalone) and docs. It needs PostgreSQL 18 or later, because the schema uses the built-in `uuidv7()`.
 
 ### 11.1 Several applications
 
 Each application runs its own taskline instance: its own workers, reaper and scheduler, its own database, and its own Valkey namespace. Instances can share a Postgres server and a Valkey server, but not tables or streams. The namespace is part of every stream name and consumer group name, so `strategiq:parse` and `otherapp:parse` never meet. Task names, schedule names and queues in one instance cannot clash with another's.
 
-Execution is federated and management is central. The admin UI is meant to read several instances' databases and show them together, filtered by instance, while each instance keeps running on its own. A single shared ledger with an application field on every table is not planned; it would be added only if a shared view cannot be had this way.
+Execution is federated and management is central. A separate UI (Taskline UI) is meant to read several instances' databases and show them together, filtered by instance, while each instance keeps running on its own. A single shared ledger with an application field on every table is not planned; it would be added only if a shared view cannot be had this way.
+
+### 11.2 The public contract
+
+Three packages are involved, each in its own repository:
+
+| Package | What it is | Depends on |
+|---|---|---|
+| **Taskline** | The job engine: workers, queues, runs, retries, the reaper | Nothing of Lattice or Taskline UI |
+| **Taskline UI** | The screens: runs, run detail, queues, workers, schedules, Run job | Lattice, for its components; Taskline, for its data and commands |
+| **Lattice** | The platform: shell, sign-in, permissions, lists, forms | Nothing of Taskline |
+
+Taskline UI uses only what `docs/public_contract.md` lists. Everything else, including the `jobs` tables, the `Store` and `Queries` classes, the middleware and the reaper, is internal and may change in any release. A test keeps the document honest (FR-52), and another test checks that nothing in Taskline imports Lattice or Taskline UI (NFR-1).
+
+The contract has four parts:
+
+1. **Python names** the host imports: the declaration names in `taskline`, the commands in `taskline.api`, `taskline.catalogue.register`, the setup functions, and `taskline.testing`.
+2. **The `taskline_api` views** (section 10.2).
+3. **The status values and refusal codes**, which are closed sets.
+4. **The version.** Taskline follows semantic versioning, and the package version is the contract's version. `taskline_api.instance.taskline_version` is the version that last migrated the database, so a host can refuse to start against a database older than it needs, for example one below 0.2 or from 0.3 on.
+
+### 11.3 Commands
+
+The operations a person performs are plain async functions in `taskline.api`: `cancel_run`, `retry_run`, `requeue` and `submit_job` (and `shutdown`, which closes the connections they opened). They do not print, parse arguments or exit. The command line is a thin layer that calls them and prints the result, and it records itself as `cli:<user>`.
+
+- **Async, and one event loop.** Everything underneath is async: the database layer, the Valkey client, and the taskiq call that sends a message. The connections the commands keep open between calls belong to the event loop that opened them, so a host should call the commands from one long-lived loop (an async request handler is ideal) and call `shutdown()` when it stops. A command that finds it is on a different loop from the one it last ran on forgets those connections and opens new ones, so a fresh `asyncio.run` for every call also works, at the cost of a new connection each time. Without that, the Valkey connection of a finished loop made the second send fail, and the failure showed up as an unsent task. One loop at a time per process.
+- **One instance per process.** The functions use the database and Valkey addresses of the process's settings (`TASKLINE_DATABASE_URL`, `TASKLINE_VALKEY_URL`, `TASKLINE_NAMESPACE`), and open their own connection pool. `cancel_run` needs only Postgres. `retry_run`, `requeue` and `submit_job` also send messages, so they need Valkey. A process that must act on several instances is served later by a small service per instance that wraps these functions; that is not built now.
+- **Actor.** Each command takes an `actor`, an opaque text such as `lattice:user:42`. It is stored in the `detail` of the events the command writes (`cancel_requested`, `cancelled`, `requeued`), and as `triggered_by` of a submitted run, which is recorded with trigger `manual`. Taskline does not interpret it.
+- **Results.** A request Taskline refuses returns a result with a refusal (a code from a closed set, and a message). A cancel of a run that has finished is one example. Anything unexpected raises. An unregistered producer or reference kind, which today surfaces as a database error, becomes a refusal.
+- **`submit_job`** takes the job's name, its values, a required producer, optional references and correlation id, and the actor. It finds the job in the catalogue and checks the values, the required references, the producer and the reference kinds before it queues anything, and returns the new run's id or a refusal (`unknown_job`, `invalid_inputs` naming each input, `missing_references`, `unknown_producer`, `unknown_reference_kind`). `retry_run` and `requeue` return `ok` with the ids of any tasks whose message could not be sent (`unsent`); `requeue` sends them.
+
+Setup functions run once at deployment, not during requests, and are synchronous like `migrate`: `migrate`, `register_producers`, `register_reference_kinds` and `schema_version`.
 
 ## 12. Configuration
 
-Taskline reads environment variables prefixed `TASKLINE_` (and its own `.env`): database URL, Valkey URL, queue-name prefix (so several applications can share one Valkey), the queue a worker consumes, which modules define tasks and jobs, which modules register hooks, heartbeat interval, lease multiple, result retention, the reaper's interval and batch size, the hand-off wait, and how long a silent worker waits before it is marked dead. Each task can override heartbeat, retries and timeout.
+Taskline reads environment variables prefixed `TASKLINE_` (and its own `.env`): database URL, Valkey URL, queue-name prefix (so several applications can share one Valkey), the queue a worker consumes, which modules define tasks and jobs, which modules register hooks, heartbeat interval, lease multiple, result retention, the reaper's interval and batch size, the hand-off wait, and how long a silent worker waits before it is marked dead. Each task can override heartbeat, retries and timeout. Three more settings serve other packages: the instance name (`TASKLINE_INSTANCE_NAME`, default: the namespace), the database role that may read `taskline_api` (`TASKLINE_API_READER_ROLE`), and the modules that define task specs and jobs without task code (`TASKLINE_CATALOGUE_MODULES`).
 
 ## 13. Assumptions still to prove by test
 
 This comes from reading library source, not from running it, and needs a real worker process:
 
 1. A plain task running on a helper thread of a real worker process is cancelled, or ended, as described in section 6.2.
+2. Proved by `tests/test_release_speed.py` (run with `uv run pytest -m release -s`): a list over the `run` view stays fast on a million runs, 3 million tasks and a million references. Each operation must finish in under a second. Measured on 19 October 2026, median of three, in milliseconds: first page 1.7; page 100 (skip 5,000 rows) 442; count of all runs 38; count by status 21; page by status 1.7; page by job name 1.7; count by job name 26; page by correlation id 1.4; page by reference 1.4; failed in the last seven days 135; the `queue` view 112. Not in the gate, and documented in the contract: filtering by a computed column (about 1.2 seconds) and paging 500,000 rows deep (about 4 seconds).
+3. Proved by `tests/test_reader_role.py`: a database role granted only on `taskline_api` can read the views and cannot read anything in `jobs`.

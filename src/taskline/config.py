@@ -9,6 +9,8 @@ class TasklineConfig(BaseSettings):
     database_url: str
     valkey_url: str
     namespace: str = "taskline"  # prefix of every Valkey stream and consumer group name
+    instance_name: str | None = None  # names this database in jobs.instance; default: the namespace
+    api_reader_role: str | None = None  # database role that may read the taskline_api views
     result_ttl_seconds: int = 86400  # how long Valkey keeps a task's result
     redelivery_seconds: int = 600  # an unacknowledged message is given to another worker after this
     reaper_interval_seconds: float = 30  # time between the reaper's passes

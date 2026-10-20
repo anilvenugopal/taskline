@@ -55,13 +55,19 @@ Taskline keeps its tables in a schema named `jobs`. It reads the database URL fr
 uv run taskline migrate
 ```
 
-This creates the `jobs` schema and a table `jobs._schema_version`, then applies any schema files not yet recorded there. Running it again applies nothing. A host application can do the same from its own code:
+This creates the `jobs` schema and a table `jobs._schema_version`, applies any schema files not yet recorded there, and records the instance's name (`TASKLINE_INSTANCE_NAME`, default: the namespace) and the Taskline version in `jobs.instance`. Running it again applies nothing. A host application does the same from its own code, with a database URL or a synchronous SQLAlchemy engine, and registers its producers and reference kinds so runs can name them:
 
 ```python
 from taskline.migrate import migrate
+from taskline.setup import Kind, register_producers, register_reference_kinds, schema_version
 
-migrate()
+migrate(engine, instance_name="strategiq")
+register_producers(engine, [Kind("strategiq.ingest", "Document ingest")])
+register_reference_kinds(engine, [Kind("strategiq.document", "Document")])
+print(schema_version(engine))  # which Taskline last migrated this database
 ```
+
+Registering is safe to repeat. It adds new codes and updates the name and description of existing ones; it never deletes.
 
 ## Run a worker and a reaper
 
@@ -102,12 +108,68 @@ uv run taskline requeue --queue parse --older-than 600
 
 `cancel` cancels the tasks of a running run that have not started and asks running tasks to stop. `retry` resumes a failed run from its failed task, inside the same run: that task gets a new set of attempts equal to its own `max_attempts`, the later tasks are planned again, and tasks that already succeeded are not run again. It refuses a run that has not failed, and a run whose failed task was never sent. If a message cannot be sent, the task stays queued and `requeue` sends it. `requeue` sends the stored messages of a queue's queued tasks again, for example after Valkey was wiped; `--older-than` leaves out tasks queued more recently. A second delivery of a task is harmless, because only one worker can claim it. These commands exit 1 when they cannot do what was asked.
 
+## Reading Taskline from another program
+
+Other programs read runs, tasks, references, events, queues and workers through the views in the schema `taskline_api`, never the `jobs` tables. Give a database role read access to the views, and nothing else, when you migrate. The role must already exist; Taskline never creates one:
+
+```python
+migrate(engine, instance_name="strategiq", reader_role="taskline_reader")
+```
+
+`taskline migrate` does the same with `TASKLINE_API_READER_ROLE`. The views, their columns and which filters stay fast on large tables are listed in [docs/public_contract.md](docs/public_contract.md). Taskline's own `runs`, `show` and `queues` commands, and the reaper, read through the same views, so **after upgrading, run `taskline migrate` before starting workers or a reaper**.
+
+## Changing runs from another program
+
+Cancel, retry, requeue and submit are plain async functions in `taskline.api`. They return results; a request Taskline refuses (cancelling a finished run, a bad input) comes back as a result with a refusal code, not an exception. Every command takes an `actor`, written into the event log so that who did it can be seen:
+
+```python
+from taskline.api import cancel_run, shutdown, submit_job
+
+result = await submit_job(
+    "ingest_document", {"url": "https://example.test/a.pdf"},
+    producer="myapp.ui", correlation_id="batch-7", actor="myapp:user:42",
+)
+if not result.ok:
+    print(result.refusal.code, result.refusal.message, result.problems)
+
+result = await cancel_run(run_id, actor="myapp:user:42")
+await shutdown()  # when the host stops
+```
+
+A job is found by name once it is registered with `taskline.catalogue.register(job)`. The commands use the database and Valkey in the process's `TASKLINE_*` settings and keep their connections open between calls, so call them from one long-lived event loop and call `shutdown()` when you stop. `taskline cancel`, `retry` and `requeue` call the same functions and record the actor as `cli:<your user>`.
+
+## Test data for programs that read Taskline
+
+A program that shows Taskline's data can write runs in known states into a migrated database, with no worker, reaper or Valkey. The runs are made by the same store operations a worker uses, so their rows and event logs are what Taskline would write. The functions are for synchronous tests, and each call takes under 0.1 second:
+
+```python
+from datetime import timedelta
+
+from taskline.testing import add_run, add_worker, clear
+
+failed = add_run(engine, state="failed", at_step=1, correlation_id="batch-7")
+running = add_run(engine, state="running", progress_pct=60)
+old = add_run(engine, state="succeeded", age=timedelta(days=2))
+add_worker(engine, queue="parse", status="dead")
+clear(engine)  # between tests; keeps the registered producers and reference kinds
+```
+
+The states are `queued`, `running`, `cancel_requested`, `retrying`, `succeeded`, `failed` and `cancelled`. See [docs/public_contract.md](docs/public_contract.md) for every option.
+
 ## Run the tests
 
 The tests need the standalone Postgres running. Each test creates its own empty database on that server and drops it afterwards. Run them from this directory so that `.env` is found:
 
 ```
 uv run pytest
+```
+
+## Versions and the public contract
+
+What other packages may rely on is listed in [docs/public_contract.md](docs/public_contract.md), and [CHANGELOG.md](CHANGELOG.md) marks every change to it. Taskline follows semantic versioning, and the package version is the contract's version. Before 1.0, a minor release may break the contract and a patch release never does, so pin `taskline>=0.2,<0.3`. Before a release, run the slow checks too:
+
+```
+uv run pytest -m release
 ```
 
 ## Stop and reset

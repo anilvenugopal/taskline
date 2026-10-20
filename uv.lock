@@ -807,10 +807,11 @@ wheels = [
 
 [[package]]
 name = "taskline"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "psycopg", extra = ["binary"] },
+    { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -829,12 +830,13 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
-    { name = "pydantic-settings" },
-    { name = "redis" },
+    { name = "pydantic", specifier = ">=2,<3" },
+    { name = "pydantic-settings", specifier = ">=2,<3" },
+    { name = "redis", specifier = ">=8,<9" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
-    { name = "taskiq" },
-    { name = "taskiq-pipelines" },
-    { name = "taskiq-redis" },
+    { name = "taskiq", specifier = ">=0.13,<0.14" },
+    { name = "taskiq-pipelines", specifier = ">=0.1.4,<0.2" },
+    { name = "taskiq-redis", specifier = ">=1.2,<2" },
 ]
 
 [package.metadata.requires-dev]

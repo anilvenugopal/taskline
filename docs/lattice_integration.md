@@ -1,23 +1,90 @@
-# What Lattice needs from Taskline
+# What Taskline UI needs from Taskline
 
 Status: **for the Taskline project to review and plan.** Written 18 October 2026
-by the Lattice project, against Taskline as it is in
-`strategiq/packages/taskline` today.
+by the Lattice project, updated 19 October 2026. Written against Taskline as it
+was copied from `strategiq/packages/taskline` (plan step 7 done, step 8 not
+started).
 
 ## Purpose
 
-Lattice will ship a Taskline UI: an app named `lattice-taskline`. It is the
-admin UI in Taskline's FR-22 (runs, run detail, workers), FR-35 (schedules) and
+Lattice is an application hosting and integration framework. Taskline needs an
+admin UI: Taskline's FR-22 (runs, run detail, workers), FR-35 (schedules) and
 FR-44 (several instances together). That answers Taskline's open question 2:
-**the UI is not part of the Taskline package.** It is a separate Lattice app
-(Lattice ADR 0006). It can run inside a business host such as strategiq, or on
-its own as an Ops console.
+**the UI is not part of the Taskline package.** It is a separate package,
+**Taskline UI**, built as a Lattice app. It can run inside a business host such
+as strategiq, or in a host of its own as an Ops console.
 
-Taskline stays its own project and package. This document lists what the
-Lattice app needs from it, so Taskline can plan those pieces in its own
-architecture and keep the right to change its internals.
+This document lists what Taskline UI needs from Taskline, so Taskline can plan
+those pieces in its own architecture and keep the right to change everything
+else.
 
-**The rule behind every item:** the Lattice app uses only Taskline's
+## How the pieces fit
+
+Three separate packages, each in its own repository:
+
+| Package | What it is | Depends on |
+|---|---|---|
+| **Taskline** (`taskline`) | The job engine: workers, queues, runs, retries, the reaper | Nothing of Lattice. It never knows Lattice exists |
+| **Taskline UI** (`taskline-ui`, package `taskline_ui`) | The screens: runs, run detail, queues, workers, schedules, Run job | Lattice, for its components; Taskline, for its data and commands |
+| **Lattice** (`lattice`) | The platform: shell, sign-in, permissions, grids, charts, forms, flows | Nothing of Taskline |
+
+```text
+   Taskline UI ──uses──► Lattice    (its components, through lattice.api)
+        │
+        └─────uses──► Taskline      (only Taskline's published contract)
+
+   Lattice  ✗  never imports Taskline
+   Taskline ✗  never imports Lattice or Taskline UI
+```
+
+**The UI's components are Lattice's.** Taskline UI draws nothing of its own: the
+runs list is a Lattice grid, a run's page is a Lattice record page, its steps a
+Lattice stepper, lineage a Lattice tree or graph, Run job a Lattice form drawn
+from the job's JSON Schema.
+
+**The UI plugs into a Lattice host.** Taskline UI exports one `AppManifest`, like
+any Lattice app. A **host**, the program that actually runs, chooses its apps:
+
+```python
+# strategiq's host: the program that runs
+import strategiq
+import taskline_ui                       # brings in taskline as its dependency
+from lattice.host import create_app
+
+app = create_app(apps=[strategiq.APP, taskline_ui.APP])
+```
+
+`create_app` reads the manifest and adds Taskline UI's pages to the menu, behind
+Lattice's sign-in and permissions, in Lattice's look. Leave it out and the host
+runs without it. The Lattice package never names Taskline; only the host does,
+by listing the app.
+
+**At run time:**
+
+```text
+┌──────────────── web process (the host) ────────────────┐
+│  Lattice: shell, sign-in, grids, forms, charts         │
+│   ├─ strategiq app ─────────── submits jobs ─┐         │
+│   └─ Taskline UI app ── reads runs, cancels ─┤         │
+└──────────────────────────────────────────────┼─────────┘
+                                               ▼
+                       taskline (the library), used in-process
+                                               │
+          ┌──────────────── Postgres ──────────┴──────┐
+          │  jobs schema: Taskline's tables and views │
+          └───────────────────▲───────────────────────┘
+                              │
+              Taskline workers and reaper: separate processes,
+              started with the `taskline` command, no Lattice in them
+```
+
+- **Business apps** (strategiq) call Taskline as a library to submit jobs. They
+  need no UI for that.
+- **Taskline UI** reads runs through Taskline's published views and acts through
+  Taskline's command functions.
+- **Taskline's workers** run on their own and know nothing of the web side.
+
+**The rule behind every item below:** Taskline UI uses only Taskline's
 **published contract**, never its internal modules or private tables. Taskline
 can then change anything not in the contract without breaking the UI.
 
@@ -26,19 +93,26 @@ Priorities:
 - **Should:** the UI works without it, but worse.
 - **Later:** needed for a later feature.
 
-## How Lattice works (the parts that matter here)
+## How Lattice works (the parts that matter to Taskline UI)
 
 - **Data:** one Postgres database per host. Lattice and each app own a schema;
   Taskline's is `jobs`. Lattice is **sync** today, with SQLAlchemy Core and
-  psycopg 3. It will add an async engine for the Taskline app.
+  psycopg 3. Taskline UI reads Taskline's views with Lattice's ordinary lists;
+  an async engine is added only if the command API is async-only.
 - **No ORM:** every SQL statement is a named query in a `.sql` file.
 - **Lists:** wrap a SQL query with search, filters, sorting and paging, in the
   database. A list's rows must therefore come from SQL the app can select from.
-- **Migrations:** `lattice migrate` applies each app's schema files. An app
-  whose library migrates itself (Taskline) has `lattice migrate` call that
-  library's migrate function instead.
-- **Standards Lattice follows** (Lattice ADR 0011 (`~/projects/lattice/docs/adr/0011-integration-standards.md`, or `docs/adr/0011-integration-standards.md` in the `anilvenugopal/lattice` repository),
-  accepted; read it with this document):
+- **Migrations:** `lattice migrate` applies each app's schema files. Taskline
+  migrates itself, so Taskline UI has `lattice migrate` call Taskline's migrate
+  function instead.
+- **Event feeds (built):** Lattice reads another system's outbox with a named
+  query returning `id, type, source, subject, time, data` for rows with
+  `id > :after`, in id order, at most `:limit`, and keeps a cursor. Item 5
+  asks Taskline for exactly that shape.
+- **Standards Lattice follows:** Lattice ADR 0011, accepted
+  (`~/projects/lattice/docs/adr/0011-integration-standards.md`, or
+  `docs/adr/0011-integration-standards.md` in the `anilvenugopal/lattice`
+  repository). Read it with this document:
   - events between apps follow **CloudEvents** (`type`, `source`, `subject`,
     `id`, `time`, `data`);
   - references to records are **URNs**: `urn:lattice:{app}.{kind}:{id}`;
@@ -48,8 +122,8 @@ Priorities:
 
 | # | Need | Why | Done when |
 |---|---|---|---|
-| 1.1 | Taskline is installable as its own package, from its own repository or a package index, at Python 3.14 | Lattice pins it like any dependency, outside the strategiq workspace | `uv add taskline@<version>` works in another repository |
-| 1.2 | Semantic versioning, and a changelog that marks contract changes | The Lattice app declares `taskline>=X,<Y` | A breaking contract change bumps the major version |
+| 1.1 | Taskline is installable as its own package, from its own repository or a package index, at Python 3.14 | Taskline UI and hosts pin it like any dependency, outside the strategiq workspace | `uv add taskline@<version>` works in another repository |
+| 1.2 | Semantic versioning, and a changelog that marks contract changes | Taskline UI declares `taskline>=X,<Y` | A breaking contract change bumps the major version |
 | 1.3 | **A written public contract**: the Python names, SQL views and event types below, listed in one document | So both projects know what may change freely and what may not | `docs/public_contract.md` exists, and a test fails when a listed name or view column disappears |
 | 1.4 | psycopg 3 and SQLAlchemy 2.x compatible with Lattice's, with no deprecation warnings under `-W error::DeprecationWarning` | They share one environment; Lattice's tests fail on deprecation warnings | Taskline's tests pass with that flag |
 
@@ -175,17 +249,17 @@ The Ops console lists runs from several Taskline databases together.
 
 ## 9. Testing support (Should)
 
-The Lattice app's tests need Taskline data in known states, without workers or
+Taskline UI's tests need Taskline data in known states, without workers or
 Valkey.
 
 | # | Need |
 |---|---|
 | 9.1 | `taskline.testing`: functions that write runs, tasks, references and events in given states (queued, running with progress, failed with an error, retried, cancelled), straight into a migrated database |
-| 9.2 | They are part of the public contract, so Lattice's tests don't reach into internals |
+| 9.2 | They are part of the public contract, so Taskline UI's tests don't reach into internals |
 
 ## Out of scope for Taskline
 
-These belong to the Lattice app, not to Taskline:
+These belong to Taskline UI, not to Taskline:
 
 - users, permissions and audit in the UI (Taskline's non-goal stands);
 - pages, lists, forms, charts and the stepper or graph views of runs;

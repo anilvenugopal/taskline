@@ -22,6 +22,10 @@ class MissingReferences(SubmissionError):
     """A job was submitted without a reference kind one of its tasks requires."""
 
 
+class DuplicateJob(Exception):
+    """A different job is already registered in the catalogue under this name."""
+
+
 class MissingValue(Exception):
     """A step needs a named value that is not in the job's values."""
 
@@ -32,6 +36,10 @@ class InvalidStepResult(Exception):
 
 class ValuesTooLarge(Exception):
     """The values passed between a job's steps are larger than the configured limit."""
+
+
+class NotMigrated(Exception):
+    """The database has no jobs schema, or one older than this Taskline needs."""
 
 
 class UnknownTask(Exception):

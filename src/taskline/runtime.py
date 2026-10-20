@@ -11,6 +11,25 @@ _store: Store | None = None
 _broker: TasklineBroker | None = None
 _started = False
 _start_lock = asyncio.Lock()
+_loop: asyncio.AbstractEventLoop | None = None  # the event loop the commands last ran on
+
+
+def bind_to_running_loop() -> None:
+    """Forget a runtime built on an event loop that has ended, so the next use builds a new one.
+
+    The connections to Postgres and Valkey belong to the loop that opened them. A host that calls
+    a command with a fresh asyncio.run each time would otherwise reuse connections of a dead loop.
+    Those cannot be closed gracefully, so they are dropped. One loop at a time per process.
+    """
+    global _loop, _store, _broker, _started, _start_lock
+    loop = asyncio.get_running_loop()
+    with _lock:
+        if _loop is not None and _loop is not loop:
+            _store = None
+            _broker = None
+            _started = False
+            _start_lock = asyncio.Lock()
+        _loop = loop
 
 
 def get_store() -> Store:
@@ -53,9 +72,10 @@ async def shutdown_runtime() -> None:
 
 def reset_runtime() -> None:
     """Forget the broker and the store so the next call builds new ones. For tests only."""
-    global _store, _broker, _started, _start_lock
+    global _store, _broker, _started, _start_lock, _loop
     with _lock:
         _store = None
         _broker = None
         _started = False
         _start_lock = asyncio.Lock()
+        _loop = None

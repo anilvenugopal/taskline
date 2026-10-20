@@ -1,14 +1,20 @@
 import argparse
+import getpass
 import sys
 import uuid
 
-from taskiq import TaskiqMessage
-
+from taskline import api
 from taskline.config import get_config
 from taskline.queries import Queries
 from taskline.report import as_json, format_queues, format_run, format_runs
-from taskline.runtime import get_broker, get_store, shutdown_runtime, start_runtime
-from taskline.store import Resend
+
+
+def cli_actor() -> str:
+    """Who the command line says it is, so its changes can be told apart in the event log."""
+    try:
+        return f"cli:{getpass.getuser()}"
+    except Exception:
+        return "cli"
 
 
 def parse_run_id(value: str) -> uuid.UUID | None:
@@ -20,19 +26,9 @@ def parse_run_id(value: str) -> uuid.UUID | None:
         return None
 
 
-async def send_messages(resend: list[Resend]) -> list[uuid.UUID]:
-    """Send stored messages to their queues; returns the ids of the tasks that could not be sent."""
-    unsent: list[uuid.UUID] = []
-    broker = get_broker()
-    await start_runtime()
-    for item in resend:
-        try:
-            message = TaskiqMessage.model_validate(item.message)
-            await broker.kick(broker.formatter.dumps(message))
-        except Exception as error:
-            print(f"taskline: could not send task {item.task_instance_id}: {error}", file=sys.stderr)
-            unsent.append(item.task_instance_id)
-    return unsent
+def refused(refusal: api.Refusal) -> int:
+    print(f"taskline: {refusal.message}", file=sys.stderr)
+    return 1
 
 
 async def runs(args: argparse.Namespace) -> int:
@@ -96,28 +92,13 @@ async def cancel(args: argparse.Namespace) -> int:
     run_id = parse_run_id(args.run_id)
     if run_id is None:
         return 2
-
-    queries = Queries(get_config().database_url)
     try:
-        detail = await queries.get_run(run_id)
+        result = await api.cancel_run(run_id, actor=cli_actor())
     finally:
-        await queries.close()
-    if detail is None:
-        print(f"taskline: no such run: {run_id}", file=sys.stderr)
-        return 1
-    if detail.run.status != "running":
-        print(f"taskline: run {run_id} is already {detail.run.status}; nothing to cancel", file=sys.stderr)
-        return 1
-
-    try:
-        result = await get_store().cancel_run(run_id)
-        await get_store().refresh_run_status(run_id)
-    finally:
-        await shutdown_runtime()
-    print(
-        f"cancelled {len(result.cancelled)} tasks, "
-        f"asked {len(result.cancel_requested)} running tasks to stop"
-    )
+        await api.shutdown()
+    if not result.ok:
+        return refused(result.refusal)
+    print(f"cancelled {result.cancelled} tasks, asked {result.cancel_requested} running tasks to stop")
     return 0
 
 
@@ -125,38 +106,30 @@ async def retry(args: argparse.Namespace) -> int:
     run_id = parse_run_id(args.run_id)
     if run_id is None:
         return 2
-
     try:
-        result = await get_store().retry_run(run_id)
-        if result.outcome != "retried":
-            reasons = {
-                "not_found": f"no such run: {run_id}",
-                "not_failed": f"run {run_id} has not failed, so it cannot be retried",
-                "never_sent": f"run {run_id} has a failed task that was never sent, so it cannot be retried",
-            }
-            print(f"taskline: {reasons[result.outcome]}", file=sys.stderr)
-            return 1
-        unsent = await send_messages(result.resend)
+        result = await api.retry_run(run_id, actor=cli_actor())
     finally:
-        await shutdown_runtime()
-
-    if unsent:
+        await api.shutdown()
+    if not result.ok:
+        return refused(result.refusal)
+    if result.unsent:
         print(
-            f"taskline: {len(unsent)} tasks stay queued without a message; "
+            f"taskline: {len(result.unsent)} tasks stay queued without a message; "
             "send them with `taskline requeue`",
             file=sys.stderr,
         )
         return 1
-    print(f"retried run {run_id}: sent {len(result.resend)} tasks")
+    print(f"retried run {run_id}: sent {result.resent} tasks")
     return 0
 
 
 async def requeue(args: argparse.Namespace) -> int:
     try:
-        resend = await get_store().take_queued(args.queue, args.older_than)
-        unsent = await send_messages(resend)
+        result = await api.requeue(args.queue, older_than_seconds=args.older_than, actor=cli_actor())
+    except ValueError as error:
+        print(f"taskline: {error}", file=sys.stderr)
+        return 2
     finally:
-        await shutdown_runtime()
-
-    print(f"requeue {args.queue}: sent {len(resend) - len(unsent)} of {len(resend)} tasks")
-    return 1 if unsent else 0
+        await api.shutdown()
+    print(f"requeue {args.queue}: sent {result.resent} of {result.resent + len(result.unsent)} tasks")
+    return 1 if result.unsent else 0

@@ -1,5 +1,6 @@
 import json
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -97,6 +98,11 @@ class RetryResult:
     # "never_sent" (a failed task has no stored message, so nothing can be resent)
     outcome: str
     resend: list[Resend] = field(default_factory=list)
+
+
+def _actor_detail(actor: str | None) -> dict[str, str]:
+    """The event detail that names who did something; empty when nobody is named."""
+    return {} if actor is None else {"actor": actor}
 
 
 class Store:
@@ -458,8 +464,42 @@ class Store:
             ).first()
         return None if row is None else row.job_run_status_code
 
-    async def cancel_run(self, job_run_id: uuid.UUID) -> CancelResult:
-        """Cancel the tasks of a run that have not started; ask running ones to stop."""
+    async def run_status(self, job_run_id: uuid.UUID) -> str | None:
+        """The status of a run, or None if there is no such run."""
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT job_run_status_code FROM jobs.job_run WHERE job_run_id = :id"),
+                    {"id": job_run_id},
+                )
+            ).first()
+        return None if row is None else row.job_run_status_code
+
+    async def unknown_kinds(
+        self, producer: str, reference_kinds: Sequence[str]
+    ) -> tuple[bool, list[str]]:
+        """Whether the producer is unregistered, and which of the reference kinds are."""
+        async with self._engine.connect() as conn:
+            producer_known = (
+                await conn.execute(
+                    text("SELECT 1 FROM jobs.producer_kind WHERE code = :code"), {"code": producer}
+                )
+            ).first() is not None
+            known = {
+                row[0]
+                for row in await conn.execute(
+                    text("SELECT code FROM jobs.reference_kind WHERE code = ANY(:codes)"),
+                    {"codes": list(reference_kinds)},
+                )
+            }
+        return not producer_known, [kind for kind in reference_kinds if kind not in known]
+
+    async def cancel_run(self, job_run_id: uuid.UUID, actor: str | None = None) -> CancelResult:
+        """Cancel the tasks of a run that have not started; ask running ones to stop.
+
+        The actor, when given, is recorded in the detail of the events written.
+        """
+        detail = _actor_detail(actor) or None  # no actor: no detail, as before
         async with self._engine.begin() as conn:
             cancelled = (
                 await conn.execute(
@@ -485,18 +525,26 @@ class Store:
                 )
             ).all()
             for row in cancelled:
-                await self._add_event(conn, row.task_instance_id, "cancelled", attempt=row.attempt)
+                await self._add_event(
+                    conn, row.task_instance_id, "cancelled", attempt=row.attempt, detail=detail
+                )
             for row in requested:
                 await self._add_event(
-                    conn, row.task_instance_id, "cancel_requested", attempt=row.attempt
+                    conn,
+                    row.task_instance_id,
+                    "cancel_requested",
+                    attempt=row.attempt,
+                    detail=detail,
                 )
             return CancelResult(
                 cancelled=[row.task_instance_id for row in cancelled],
                 cancel_requested=[row.task_instance_id for row in requested],
             )
 
-    async def retry_run(self, job_run_id: uuid.UUID) -> RetryResult:
+    async def retry_run(self, job_run_id: uuid.UUID, actor: str | None = None) -> RetryResult:
         """Resume a failed run in place from its failed tasks.
+
+        The actor, when given, is recorded in the detail of the events written.
 
         Each failed task is queued again with a new set of attempts: as many as the
         task's own max_attempts label, counted from the attempts already used. Steps
@@ -565,7 +613,7 @@ class Store:
                     row.task_instance_id,
                     "requeued",
                     attempt=row.attempt,
-                    detail={"reason": "run_retry"},
+                    detail={"reason": "run_retry", **_actor_detail(actor)},
                 )
             return RetryResult("retried", [Resend(row.task_instance_id, row.message) for row in queued])
 
@@ -710,11 +758,15 @@ class Store:
             return [Resend(row.task_instance_id, row.message) for row in taken]
 
     async def take_queued(
-        self, queue_name: str, older_than_seconds: float | None = None
+        self,
+        queue_name: str,
+        older_than_seconds: float | None = None,
+        actor: str | None = None,
     ) -> list[Resend]:
         """Restamp the queued tasks of a queue as queued now; returns their messages to send.
 
-        Only tasks queued at least older_than_seconds ago are taken when it is given.
+        Only tasks queued at least older_than_seconds ago are taken when it is given. The actor,
+        when given, is recorded in the detail of the events written.
         """
         async with self._engine.begin() as conn:
             taken = (
@@ -739,7 +791,7 @@ class Store:
                     row.task_instance_id,
                     "requeued",
                     attempt=row.attempt,
-                    detail={"reason": "manual"},
+                    detail={"reason": "manual", **_actor_detail(actor)},
                 )
             return [Resend(row.task_instance_id, row.message) for row in taken]
 

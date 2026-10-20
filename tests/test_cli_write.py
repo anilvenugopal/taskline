@@ -1,66 +1,16 @@
-import json
 import uuid
 
-from helpers import make_plan, rows, taskline
-from redis import Redis
-
-from taskline.config import get_config
-
-
-def message_for(task_id, name: str = "echo") -> str:
-    return json.dumps(
-        {
-            "task_id": str(task_id),
-            "task_name": name,
-            "labels": {"queue_name": "work", "max_attempts": "3"},
-            "args": [],
-            "kwargs": {},
-        }
-    )
-
-
-def stream_task_ids(namespace: str) -> list[str]:
-    client = Redis.from_url(get_config().valkey_url)
-    try:
-        entries = client.xrange(f"{namespace}:work")
-    finally:
-        client.close()
-    return [json.loads(fields[b"data"])["task_id"] for _, fields in entries]
-
-
-def set_task(url: str, task_id, **columns) -> None:
-    assignments = ", ".join(f"{name} = :{name}" for name in columns)
-    rows(
-        url,
-        f"UPDATE jobs.task_instance SET {assignments} WHERE task_instance_id = :id RETURNING 1",
-        id=task_id,
-        **columns,
-    )
-
-
-def statuses(url: str) -> list[str]:
-    return [r.task_status_code for r in rows(url, "SELECT task_status_code FROM jobs.task_instance ORDER BY step_index")]
-
-
-def run_status(url: str) -> str:
-    return rows(url, "SELECT job_run_status_code FROM jobs.job_run")[0].job_run_status_code
-
-
-async def failed_run(store, url: str):
-    """Step 1 succeeded, step 2 failed with its message stored, step 3 upstream_failed."""
-    plan = make_plan(step_count=3)
-    await store.register_run(plan)
-    for step, status in zip(plan.steps, ["succeeded", "failed", "upstream_failed"], strict=True):
-        set_task(url, step.task_instance_id, task_status_code=status, queue_name="work")
-    set_task(
-        url,
-        plan.steps[1].task_instance_id,
-        attempt=3,
-        max_attempts=3,
-        message=message_for(plan.steps[1].task_instance_id),
-    )
-    await store.refresh_run_status(plan.job_run_id)
-    return plan
+from helpers import (
+    failed_run,
+    make_plan,
+    message_for,
+    rows,
+    run_status,
+    set_task,
+    statuses,
+    stream_task_ids,
+    taskline,
+)
 
 
 async def test_cancel_cancels_an_unstarted_run(runtime, store, empty_database_url):
@@ -160,3 +110,15 @@ async def test_requeue_with_older_than_leaves_recent_tasks(runtime, store, empty
 
     assert result.stdout.strip() == "requeue work: sent 0 of 0 tasks"
     assert stream_task_ids(runtime) == []
+
+
+
+async def test_cancel_from_the_command_line_is_recorded_with_a_cli_actor(runtime, store, empty_database_url):
+    plan = make_plan(step_count=2)
+    await store.register_run(plan)
+
+    result = taskline("cancel", str(plan.job_run_id))
+
+    assert result.returncode == 0
+    actors = {r.detail["actor"] for r in rows(empty_database_url, "SELECT detail FROM jobs.task_event WHERE task_event_code = 'cancelled'")}
+    assert len(actors) == 1 and actors.pop().startswith("cli")

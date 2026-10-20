@@ -5,6 +5,7 @@ from typing import NoReturn
 
 from pydantic import ValidationError
 
+from taskline.config import get_config
 from taskline.migrate import migrate
 
 
@@ -70,7 +71,12 @@ def main() -> None:
     args = build_parser().parse_args()
 
     if args.command == "migrate":
-        applied = migrate()
+        config = get_config()
+        applied = migrate(
+            config.database_url,
+            instance_name=config.instance_name or config.namespace,
+            reader_role=config.api_reader_role,
+        )
         print("applied:", ", ".join(applied) if applied else "schema is up to date")
         return
 

@@ -83,17 +83,17 @@ class RunDetail:
 
 
 _RUN_COLUMNS = (
-    "r.job_run_id, r.job_name, r.job_run_status_code, r.producer_code, r.correlation_id, "
+    "r.run_id, r.job_name, r.status, r.producer, r.correlation_id, "
     "r.triggered_by, r.step_count, r.created_at, r.finished_at"
 )
 
 
 def _run_summary(row: Any) -> RunSummary:
     return RunSummary(
-        job_run_id=row.job_run_id,
+        job_run_id=row.run_id,
         job_name=row.job_name,
-        status=row.job_run_status_code,
-        producer_code=row.producer_code,
+        status=row.status,
+        producer_code=row.producer,
         correlation_id=row.correlation_id,
         triggered_by=row.triggered_by,
         step_count=row.step_count,
@@ -103,7 +103,10 @@ def _run_summary(row: Any) -> RunSummary:
 
 
 class Queries:
-    """Read-only questions about the jobs schema. Nothing here changes any row."""
+    """Read-only questions about runs and queues, answered through the taskline_api views, so
+    Taskline's own command line uses the same read contract as other programs. Nothing here
+    changes any row. task_info, task_error and live_reapers are the reaper's own questions and
+    read the jobs tables."""
 
     def __init__(self, database_url: str) -> None:
         self._engine = create_async_engine(database_url, pool_pre_ping=True)
@@ -114,47 +117,25 @@ class Queries:
     async def queue_counts(self) -> list[QueueCounts]:
         """For each queue with open tasks or live workers: its load and its live workers."""
         async with self._engine.connect() as conn:
-            load = (
+            result = (
                 await conn.execute(
                     text(
-                        "SELECT queue_name, "
-                        "count(*) FILTER (WHERE task_status_code = 'queued') AS queued, "
-                        "count(*) FILTER (WHERE task_status_code = 'running') AS running, "
-                        "count(*) FILTER (WHERE task_status_code = 'retrying') AS retrying, "
-                        "EXTRACT(EPOCH FROM now() - min(queued_at) "
-                        "FILTER (WHERE task_status_code = 'queued')) AS oldest_queued_seconds "
-                        "FROM jobs.task_instance "
-                        "WHERE task_status_code IN ('queued', 'running', 'retrying') "
-                        "GROUP BY queue_name"
+                        "SELECT queue, queued, running, retrying, oldest_queued_seconds, "
+                        "live_workers FROM taskline_api.queue ORDER BY queue"
                     )
                 )
             ).all()
-            workers = (
-                await conn.execute(
-                    text(
-                        "SELECT queue_name, count(*) AS live FROM jobs.worker "
-                        "WHERE worker_status_code = 'alive' AND queue_name <> :reaper "
-                        "GROUP BY queue_name"
-                    ),
-                    {"reaper": REAPER_QUEUE},
-                )
-            ).all()
-
-        live = {row.queue_name: row.live for row in workers}
-        counts = {
-            row.queue_name: QueueCounts(
-                row.queue_name,
+        return [
+            QueueCounts(
+                row.queue,
                 row.queued,
                 row.running,
                 row.retrying,
                 None if row.oldest_queued_seconds is None else float(row.oldest_queued_seconds),
-                live.get(row.queue_name, 0),
+                row.live_workers,
             )
-            for row in load
-        }
-        for queue_name, count in live.items():
-            counts.setdefault(queue_name, QueueCounts(queue_name, 0, 0, 0, None, count))
-        return sorted(counts.values(), key=lambda c: c.queue_name)
+            for row in result
+        ]
 
     async def list_runs(
         self,
@@ -170,10 +151,10 @@ class Queries:
         conditions: list[str] = []
         params: dict[str, Any] = {"limit": limit}
         if status is not None:
-            conditions.append("r.job_run_status_code = :status")
+            conditions.append("r.status = :status")
             params["status"] = status
         if producer is not None:
-            conditions.append("r.producer_code = :producer")
+            conditions.append("r.producer = :producer")
             params["producer"] = producer
         if job_name is not None:
             conditions.append("r.job_name = :job_name")
@@ -183,8 +164,8 @@ class Queries:
             params["correlation_id"] = correlation_id
         if reference is not None:
             conditions.append(
-                "EXISTS (SELECT 1 FROM jobs.job_reference f WHERE f.job_run_id = r.job_run_id "
-                "AND f.reference_kind_code = :reference_kind AND f.external_id = :reference_id)"
+                "EXISTS (SELECT 1 FROM taskline_api.reference f WHERE f.run_id = r.run_id "
+                "AND f.kind = :reference_kind AND f.external_id = :reference_id)"
             )
             params["reference_kind"], params["reference_id"] = reference
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
@@ -192,8 +173,8 @@ class Queries:
             result = (
                 await conn.execute(
                     text(
-                        f"SELECT {_RUN_COLUMNS} FROM jobs.job_run r {where} "
-                        "ORDER BY r.created_at DESC, r.job_run_id DESC LIMIT :limit"
+                        f"SELECT {_RUN_COLUMNS} FROM taskline_api.run r {where} "
+                        "ORDER BY r.created_at DESC, r.run_id DESC LIMIT :limit"
                     ),
                     params,
                 )
@@ -207,7 +188,7 @@ class Queries:
         async with self._engine.connect() as conn:
             run = (
                 await conn.execute(
-                    text(f"SELECT {_RUN_COLUMNS} FROM jobs.job_run r WHERE r.job_run_id = :id"),
+                    text(f"SELECT {_RUN_COLUMNS} FROM taskline_api.run r WHERE r.run_id = :id"),
                     {"id": job_run_id},
                 )
             ).first()
@@ -216,10 +197,10 @@ class Queries:
             tasks = (
                 await conn.execute(
                     text(
-                        "SELECT task_instance_id, step_index, task_name, queue_name, "
-                        "task_status_code, attempt, max_attempts, worker_id, started_at, "
-                        "finished_at, progress_pct, progress_note, error_type, error_detail "
-                        "FROM jobs.task_instance WHERE job_run_id = :id ORDER BY step_index"
+                        "SELECT task_id, step_index, task_name, queue, status, attempt, "
+                        "max_attempts, worker_id, started_at, finished_at, progress_pct, "
+                        "progress_note, error_type, error_detail "
+                        "FROM taskline_api.task WHERE run_id = :id ORDER BY step_index"
                     ),
                     {"id": job_run_id},
                 )
@@ -227,10 +208,9 @@ class Queries:
             references = (
                 await conn.execute(
                     text(
-                        "SELECT f.reference_kind_code, f.external_id, f.reference_relation_code, "
-                        "f.label, f.url, t.step_index FROM jobs.job_reference f "
-                        "LEFT JOIN jobs.task_instance t ON t.task_instance_id = f.task_instance_id "
-                        "WHERE f.job_run_id = :id ORDER BY f.created_at, f.job_reference_id"
+                        "SELECT kind, external_id, relation, label, url, step_index "
+                        "FROM taskline_api.reference WHERE run_id = :id "
+                        "ORDER BY created_at, step_index NULLS FIRST, kind, external_id"
                     ),
                     {"id": job_run_id},
                 )
@@ -240,10 +220,9 @@ class Queries:
                 events = (
                     await conn.execute(
                         text(
-                            "SELECT t.step_index, t.task_name, e.task_event_code, e.attempt, "
-                            "e.worker_id, e.detail, e.occurred_at FROM jobs.task_event e "
-                            "JOIN jobs.task_instance t ON t.task_instance_id = e.task_instance_id "
-                            "WHERE t.job_run_id = :id ORDER BY e.task_event_id"
+                            "SELECT step_index, task_name, event, attempt, worker_id, detail, "
+                            "occurred_at FROM taskline_api.event WHERE run_id = :id "
+                            "ORDER BY event_id"
                         ),
                         {"id": job_run_id},
                     )
@@ -253,11 +232,11 @@ class Queries:
             run=_run_summary(run),
             tasks=[
                 TaskRow(
-                    task_instance_id=row.task_instance_id,
+                    task_instance_id=row.task_id,
                     step_index=row.step_index,
                     task_name=row.task_name,
-                    queue_name=row.queue_name,
-                    status=row.task_status_code,
+                    queue_name=row.queue,
+                    status=row.status,
                     attempt=row.attempt,
                     max_attempts=row.max_attempts,
                     worker_id=row.worker_id,
@@ -272,9 +251,9 @@ class Queries:
             ],
             references=[
                 ReferenceRow(
-                    reference_kind_code=row.reference_kind_code,
+                    reference_kind_code=row.kind,
                     external_id=row.external_id,
-                    relation=row.reference_relation_code,
+                    relation=row.relation,
                     label=row.label,
                     url=row.url,
                     step_index=row.step_index,
@@ -285,7 +264,7 @@ class Queries:
                 EventRow(
                     step_index=row.step_index,
                     task_name=row.task_name,
-                    event=row.task_event_code,
+                    event=row.event,
                     attempt=row.attempt,
                     worker_id=row.worker_id,
                     detail=row.detail,

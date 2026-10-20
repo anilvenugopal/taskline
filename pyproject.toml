@@ -4,17 +4,18 @@ build-backend = "hatchling.build"
 
 [project]
 name = "taskline"
-version = "0.1.0"
+version = "0.2.0"
 description = "Task execution engine on taskiq: chains, lifecycle hooks, leased heartbeats, lineage tracking in Postgres."
 requires-python = ">=3.14"
 dependencies = [
-    "taskiq",
-    "taskiq-redis",
-    "taskiq-pipelines",
-    "redis",
+    "taskiq>=0.13,<0.14",
+    "taskiq-redis>=1.2,<2",
+    "taskiq-pipelines>=0.1.4,<0.2",
+    "redis>=8,<9",
     "sqlalchemy[asyncio]>=2.0",
     "psycopg[binary]>=3.2",
-    "pydantic-settings",
+    "pydantic>=2,<3",
+    "pydantic-settings>=2,<3",
 ]
 
 [project.scripts]
@@ -31,6 +32,11 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
+addopts = "-m 'not release'"
+filterwarnings = ["error::DeprecationWarning"]
+markers = [
+    "release: slow checks to run before a release (wheel install, speed on a million runs); run with `pytest -m release`",
+]
 
 [tool.ruff]
 line-length = 100
