@@ -118,6 +118,43 @@ migrate(engine, instance_name="strategiq", reader_role="taskline_reader")
 
 `taskline migrate` does the same with `TASKLINE_API_READER_ROLE`. The views, their columns and which filters stay fast on large tables are listed in [docs/public_contract.md](docs/public_contract.md). Taskline's own `runs`, `show` and `queues` commands, and the reaper, read through the same views, so **after upgrading, run `taskline migrate` before starting workers or a reaper**.
 
+## Declaring a job's inputs
+
+A job's inputs can be a Pydantic model, which gives each input a type, a required flag, a default and a description. Taskline checks a submission against it, names each wrong input, and sends the model's result (values coerced to the declared types, defaults filled in). Names-only inputs (`inputs=["url"]`) still work.
+
+```python
+from datetime import date
+
+from pydantic import BaseModel, Field
+
+from taskline import Job, Step
+from taskline.catalogue import register
+
+
+class IngestInputs(BaseModel):
+    url: str = Field(description="Where to fetch the document")
+    project_id: int = Field(description="The project to file it under")
+    due: date | None = None  # a default makes an input optional
+
+
+INGEST = register(Job(
+    "ingest_document",
+    inputs=IngestInputs,
+    description="Fetch a document and file it",
+    steps=[Step(FETCH, inputs={"url": "url", "project_id": "project_id"})],
+))
+```
+
+A program that submits or lists jobs but never runs a task, such as a web app, keeps its jobs in modules that define task specs and jobs and nothing else, names them in `TASKLINE_CATALOGUE_MODULES`, and loads them:
+
+```python
+from taskline.api import list_jobs, load_catalogue
+
+load_catalogue()                 # imports the modules in TASKLINE_CATALOGUE_MODULES
+for job in list_jobs():          # name, description, steps and queues, required reference kinds
+    print(job.name, job.input_schema)  # input_schema is JSON Schema, for drawing a form
+```
+
 ## Changing runs from another program
 
 Cancel, retry, requeue and submit are plain async functions in `taskline.api`. They return results; a request Taskline refuses (cancelling a finished run, a bad input) comes back as a result with a refusal code, not an exception. Every command takes an `actor`, written into the event log so that who did it can be seen:

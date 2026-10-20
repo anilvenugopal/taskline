@@ -26,20 +26,32 @@ starts enforcing it when step N removes the marker.
 
 ### taskline
 
-| name | kind |
-|---|---|
-| Job | class |
-| Step | class |
-| TaskSpec | class |
-| Reference | class |
-| NonRetryable | exception |
-| TaskCancelled | exception |
-| task | decorator |
-| submit | async function |
-| hooks | registry |
-| current_lineage | function |
-| cancel_requested | function |
-| report_progress | function |
+| name | kind | parameters |
+|---|---|---|
+| Job | class | name, steps, inputs, description |
+| Step | class |  |
+| TaskSpec | class |  |
+| Reference | class | reference_kind_code, external_id, reference_relation_code, label, url, step_index |
+| NonRetryable | exception |  |
+| TaskCancelled | exception |  |
+| task | decorator |  |
+| submit | async function |  |
+| hooks | registry |  |
+| current_lineage | function |  |
+| cancel_requested | function |  |
+| report_progress | function |  |
+
+`Reference` names a host object a run concerns. The parameters `reference_kind_code`, `external_id` and
+`reference_relation_code` are required: a registered kind (for example `strategiq.document`), the host's id for
+the object, and one of the reference relations in "Status values". `label`, `url` and `step_index` are optional
+(`step_index` left out means the reference is about the whole run). It is the value of the `references` parameter
+of `taskline.api.submit_job` and `taskline.testing.add_run`:
+
+```python
+from taskline import Reference
+
+Reference("strategiq.document", "doc-1", "subject", label="Zurich 10-K, 2026", url="https://host/docs/1")
+```
 
 ### taskline.api (run time, async)
 
@@ -72,14 +84,37 @@ calls. Call them from one long-lived event loop (an async request handler is ide
 the host stops. Calling a command with a fresh `asyncio.run` each time also works, but opens new connections
 every time. Use one event loop at a time per process. `cancel_run` needs only Postgres; the others also need Valkey.
 
-### taskline.api catalogue part (sync) [planned: step 12]
+### taskline.api catalogue part (sync)
 
 | name | kind | parameters |
 |---|---|---|
 | list_jobs | function (sync) | none |
 | load_catalogue | function (sync) | modules |
+| CatalogueError | exception | |
 | JobInfo | class | name, description, steps, required_reference_kinds, input_schema |
 | StepInfo | class | index, task_name, queue |
+
+`list_jobs()` returns a `JobInfo` for every registered job, by name: its `description`, its `steps` (a `StepInfo`
+for each, with the `index` from 0 as in the `step_index` of the views, the task's name and its queue), the
+reference kinds a submission must give (`required_reference_kinds`), and the JSON Schema of its inputs
+(`input_schema`). The schemas are copies; changing one does not change the job.
+
+`load_catalogue(modules)` imports modules that define task specs and jobs, so that importing them registers the
+jobs. `modules` is a list, or comma-separated text; left out, the modules in `TASKLINE_CATALOGUE_MODULES` are
+loaded. Such a module should define specs and jobs and import no task code, so a web process can load it. A module
+that cannot be imported raises `CatalogueError` naming it. Loading a module twice is harmless.
+
+A job's inputs (`inputs` of `Job`) are either the names of the values a submitter gives, untyped, or a Pydantic
+model class whose fields are the inputs, with their types, which are required, their defaults and descriptions
+(a field with an alias is refused). `input_schema` is a JSON Schema object with `properties`, `required` and
+`additionalProperties: false`; for a job with names only, each property is untyped and every name is required.
+Types are declared on the job, not read from the task functions, because a submitter never needs the task's code;
+a task whose own type hints disagree still fails when it starts.
+
+`submit_job` refuses a submission whose values do not fit, with the code `invalid_inputs` and a `problems` list
+naming each input at fault (`(inputs)` for a rule across several inputs). A value that is not an input is always
+refused. The refused values themselves are never repeated in a message. For a job with a model, what is sent to the
+job is the model's result: values coerced to the declared types, defaults filled in, and everything as JSON.
 
 ### taskline.setup (deployment time, sync)
 
@@ -106,6 +141,7 @@ and nothing else. The role must already exist; Taskline never creates one.
 | name | kind | parameters |
 |---|---|---|
 | register | function | job |
+| DuplicateJob | exception | |
 
 `register(job)` adds a job to the process's catalogue so `submit_job` can find it by name, and returns the job,
 so a module can say `INGEST = register(Job(...))`. Registering the same definition again is harmless; a
@@ -148,6 +184,49 @@ reference kinds and the instance.
 | event | queued, claimed, succeeded, failed, retry_scheduled, lost, requeued, cancel_requested, cancelled, upstream_failed, duplicate_skipped |
 
 A run is never `queued`: it is `running` from the moment it is submitted.
+
+## Events
+
+What each value of `event` in `taskline_api.event` means. `attempt` is the number of attempts that had
+**started** when the event was written, so it is 0 for a task that has not started, and it is null where
+an attempt does not apply. Within one task, read events in the order of `occurred_at`, then `event_id`.
+
+| event | written when | attempt | worker_id | detail |
+|---|---|---|---|---|
+| queued | the task's message is first sent to its queue | 0 | none | none |
+| claimed | a worker takes the lease and starts an attempt | the attempt that started | the worker | none |
+| succeeded | the attempt finished without error | that attempt | the worker | none |
+| failed | the task failed for good: its last attempt raised, or a lost lease on its last attempt, or a step the previous step never handed over | that attempt; 0 for a hand-over that was lost | the worker, if an attempt was running | error_type, error |
+| retry_scheduled | an attempt raised and another is allowed | the attempt that raised | the worker | error_type, error, retry_in_seconds |
+| requeued | the task is put on its queue again: a retry came due (reason retry_due), an operator retried the run (run_retry), or an operator sent the queue again (manual) | attempts started so far | none | reason, and actor when an operator did it |
+| lost | a lease ran out without a heartbeat and the reaper took the task back | the attempt that was running | the worker that held it | next (retrying or failed) |
+| cancel_requested | a running task was asked to stop | the running attempt | none | actor, when given |
+| cancelled | the task stopped on request: at its next heartbeat if it was running, at once if it had not started | attempts started so far | the worker, if it was running | actor, when given |
+| upstream_failed | an earlier step failed for good, so this planned step will not run | null | none | after_step |
+| duplicate_skipped | a second delivery of a message found the task already running or finished, and was ignored | the task's current attempt | the worker holding it | status, held_by |
+
+### Event sequences
+
+What one task's log holds, in order, as `event/attempt` (`-` is null). A test runs each case and fails
+when the log differs.
+
+| case | events |
+|---|---|
+| succeeds first time | queued/0, claimed/1, succeeded/1 |
+| fails twice, retry pending | queued/0, claimed/1, retry_scheduled/1, requeued/1, claimed/2, retry_scheduled/2 |
+| fails on its last attempt | queued/0, claimed/1, retry_scheduled/1, requeued/1, claimed/2, retry_scheduled/2, requeued/2, claimed/3, failed/3 |
+| a later step after a failure | upstream_failed/- |
+| running task asked to stop | queued/0, claimed/1, cancel_requested/1 |
+| step cancelled before it started | cancelled/0 |
+| worker disappears | queued/0, claimed/1, lost/1 |
+| operator retries a failed run | requeued/3 |
+| operator sends a queue again | queued/0, requeued/0 |
+| step never handed over | failed/0 |
+| duplicate delivery | queued/0, claimed/1, duplicate_skipped/1 |
+
+Notes: "operator retries a failed run" shows only what the retry adds, after the failure; `3` is the
+attempts the task had used. After a retry the task gets more attempts, so its next `claimed` is attempt 4.
+When a worker disappears on the last attempt, `lost` is followed by `failed`, both at that attempt.
 
 ## Refusal codes
 

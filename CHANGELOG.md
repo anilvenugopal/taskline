@@ -3,6 +3,27 @@
 Newest first. A **Contract** entry changes what `docs/public_contract.md` lists. Before 1.0 a minor release
 may include breaking contract changes and a patch release never does.
 
+## 0.3.0, 2026-10-20
+
+Typed job inputs and the job listing Taskline UI draws its "Run job" form from.
+
+### Contract
+- A job's inputs can be a Pydantic model: each input has a type, a required flag, a default and a description.
+  Names-only inputs keep working. `Job` gains `description`, and every job has an `input_schema`, a JSON Schema
+  of its inputs. `submit_job` validates the values, names each wrong input in `problems` (`(inputs)` for a rule
+  across several), never repeats a refused value, and sends the model's result: coerced to the declared types
+  with defaults filled in. A value that is not an input is always refused.
+- Added `taskline.api.list_jobs` (with `JobInfo` and `StepInfo`) and `load_catalogue` (with `CatalogueError`),
+  and the setting `TASKLINE_CATALOGUE_MODULES`, so a program that never runs a task can list and submit jobs.
+- Listed `DuplicateJob` in `taskline.catalogue` and the parameters of `Job` in the contract; both already existed.
+- Documented what each `taskline_api.event` value means: when it is written, what `attempt`, `worker_id` and
+  `detail` hold, and the event sequences of common cases ("Events" and "Event sequences" in the contract).
+  This describes behaviour that already existed, so nothing changes for a reader. `attempt` is the number of
+  attempts started when the event was written, so a task not yet started is at 0. A test
+  (`tests/test_event_contract.py`) runs each case and fails when the log differs from the document.
+- Documented `taskline.Reference`: its parameters, and that it is the value of the `references` parameter of
+  `submit_job` and `add_run`. The contract test now checks the parameters. Nothing changes in the code.
+
 ## 0.2.0, 2026-10-19
 
 The first contract release: Taskline UI can build against it.

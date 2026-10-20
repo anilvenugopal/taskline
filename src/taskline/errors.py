@@ -1,3 +1,7 @@
+from collections.abc import Sequence
+from typing import Any
+
+
 class DuplicateTask(Exception):
     """A task name was registered twice in one process."""
 
@@ -8,6 +12,21 @@ class GracePeriodTooShort(Exception):
 
 class SubmissionError(ValueError):
     """A job was submitted with inputs or references that do not fit its definition."""
+
+
+class InvalidInputs(SubmissionError):
+    """A job was submitted with values its declared input types do not accept.
+
+    problems names each input at fault. The refused values themselves are never in the message.
+    """
+
+    def __init__(self, message: str, problems: Sequence[Any]) -> None:
+        super().__init__(message)
+        self.problems = tuple(problems)
+
+
+class CatalogueError(Exception):
+    """A module that defines jobs could not be imported."""
 
 
 class MissingInputs(SubmissionError):

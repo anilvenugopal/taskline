@@ -2,6 +2,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel
+
 from taskline.spec import TaskSpec
 
 # The name under which a step's wiring is sent to the worker as a keyword argument.
@@ -52,19 +54,48 @@ class Step:
 
 @dataclass(frozen=True)
 class Job:
-    """A named unit of work: declared inputs and one or more steps run in order."""
+    """A named unit of work: declared inputs and one or more steps run in order.
+
+    inputs is either the names of the values a submitter gives (untyped), or a Pydantic model
+    class whose fields are the inputs: with their types, which are required, their defaults and
+    descriptions. Either way, inputs afterwards is the tuple of names, and input_schema is the
+    JSON Schema of the inputs, from which a UI can draw a form. The types are declared here, not
+    read from the task functions, because a submitter never needs the task's code.
+    """
 
     name: str
     steps: Sequence[Step]
-    inputs: Sequence[str] = ()
+    inputs: Sequence[str] | type[BaseModel] = ()
+    description: str = ""
+    # Worked out from inputs when the job is defined. The model decides how submitted values are
+    # checked; the schema is compared, so a module that defines the same job twice is harmless.
+    input_model: type[BaseModel] | None = field(default=None, init=False, compare=False, repr=False)
+    input_schema: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "steps", tuple(self.steps))
-        object.__setattr__(self, "inputs", tuple(self.inputs))
         if not self.name:
             raise ValueError("a job needs a name")
         if not self.steps:
             raise ValueError(f"job {self.name!r} needs at least one step")
+
+        if isinstance(self.inputs, type) and issubclass(self.inputs, BaseModel):
+            model = self.inputs
+            self._check_model(model)
+            object.__setattr__(self, "input_model", model)
+            object.__setattr__(self, "inputs", tuple(model.model_fields))
+            schema = model.model_json_schema()
+        else:
+            names = tuple(self.inputs)
+            object.__setattr__(self, "inputs", names)
+            schema = {
+                "title": self.name,
+                "type": "object",
+                "properties": {name: {} for name in names},
+                "required": list(names),
+            }
+        schema["additionalProperties"] = False  # a value that is not an input is refused
+        object.__setattr__(self, "input_schema", schema)
         self._check_wiring()
 
     @classmethod
@@ -75,6 +106,13 @@ class Job:
 
     def required_references(self) -> set[str]:
         return {kind for step in self.steps for kind in step.task.requires_references}
+
+    def _check_model(self, model: type[BaseModel]) -> None:
+        for name, info in model.model_fields.items():
+            if info.alias is not None or info.validation_alias is not None:
+                raise ValueError(
+                    f"job {self.name!r}: input {name!r} has an alias; inputs are given by their field names"
+                )
 
     def _check_wiring(self) -> None:
         available: set[str] = set()

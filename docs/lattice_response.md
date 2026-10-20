@@ -1,8 +1,9 @@
 # Taskline's response to "What Taskline UI needs from Taskline"
 
-Status: **steps 8 to 11 of Taskline's plan are done. Version 0.2.0, the first contract release, is prepared;
-it becomes installable from a git tag once the maintainer tags it.** Written 19 October 2026 for the Lattice
-project, in answer to `docs/lattice_integration.md`.
+Status: **steps 8 to 12 of Taskline's plan are done.** Versions 0.2.0 (commands and views) and 0.3.0 (typed
+job inputs and the job listing) are ready; each becomes installable from the git repository when the
+maintainer pushes its tag. Written 19 and 20 October 2026 for the Lattice project, in answer to
+`docs/lattice_integration.md`.
 
 Taskline accepts almost all of it. This note says what you can use today, what differs from your list and why,
 what we need you to do, and what comes next. The authoritative list of everything you may rely on is
@@ -13,10 +14,10 @@ column type disappears.
 
 | Your item | Status | What you get |
 |---|---|---|
-| 1 Packaging, versioning, contract | **Done**; 0.2.0 is prepared and awaits its git tag | A written contract with a test that fails when a listed name or column goes. Semantic versioning and a changelog that marks contract changes. Installs from a git tag. Tests pass with deprecation warnings as errors. Dependencies carry version ceilings |
+| 1 Packaging, versioning, contract | **Done**; versions 0.2.0 and 0.3.0 are ready and become installable when tagged | A written contract with a test that fails when a listed name or column goes. Semantic versioning and a changelog that marks contract changes. Installs from a git tag. Tests pass with deprecation warnings as errors. Dependencies carry version ceilings |
 | 2 Read views | **Done** | Schema `taskline_api`: `run`, `task`, `reference`, `event`, `queue`, `worker`, `instance`. `schedule` arrives with the scheduler |
 | 3 Command API | **Done** | Async functions `cancel_run`, `retry_run`, `requeue`, `submit_job` with an `actor`, typed results and refusal codes |
-| 4 Job catalogue and typed inputs | Step 12, release 0.3.0 | Pydantic-model inputs with JSON Schema, `list_jobs()` |
+| 4 Job catalogue and typed inputs | **Done** (0.3.0) | Pydantic-model inputs with JSON Schema, `list_jobs()`, `load_catalogue()` |
 | 5 Events | **Not provided** (see "What differs") | Poll `taskline_api.run` |
 | 6 References | **Done**, with one difference | Dotted kind codes work; `register_reference_kinds`; runs found by reference are indexed. No `urn` column |
 | 7 Several instances | **Done** | `taskline_api.instance`: `name`, `taskline_version`, `schema_version` |
@@ -109,13 +110,44 @@ await shutdown()  # when your host stops
   `triggered_by` of a submitted run, which is recorded with trigger `manual`. An empty actor raises `ValueError`.
 - **`unsent`:** `retry_run` and `requeue` can succeed in the database but fail to put a message on the queue (Valkey
   down). The result is then `ok` with those task ids in `unsent`, and `requeue` sends them.
-- **`submit_job` checks everything before it queues anything**, so a refusal leaves nothing behind. Until step 12
-  `invalid_inputs` names inputs that are missing or that the job does not take; typed validation arrives with it.
+- **`submit_job` checks everything before it queues anything**, so a refusal leaves nothing behind. `invalid_inputs`
+  names each input at fault (see "Jobs and their inputs").
 - **Event loops.** The commands keep their Postgres and Valkey connections open between calls, and those belong to the
   event loop that opened them. Call the commands from one long-lived loop (an async request handler is ideal) and
   call `shutdown()` when the host stops. A fresh `asyncio.run` per call also works (a runtime built on an ended
   loop is rebuilt), at the cost of a new connection each time. One event loop at a time per process.
 - `cancel_run` needs only Postgres; the others also need Valkey (`TASKLINE_VALKEY_URL`, `TASKLINE_NAMESPACE`).
+
+**Jobs and their inputs (0.3.0).** A job's inputs can be a Pydantic model, which gives each input a type, a
+required flag, a default and a description. `list_jobs()` and `load_catalogue()` are plain synchronous functions:
+
+```python
+from taskline.api import list_jobs, load_catalogue
+
+load_catalogue()   # imports the modules in TASKLINE_CATALOGUE_MODULES, or load_catalogue(["myapp.jobs"])
+for job in list_jobs():
+    job.name, job.description
+    job.steps                      # StepInfo(index, task_name, queue), index from 0 as in the views' step_index
+    job.required_reference_kinds   # a submission must give a reference of each kind
+    job.input_schema               # JSON Schema: the form to draw
+```
+
+- **Draw the form from `input_schema`.** It is a JSON Schema object: `properties` (each with `type`, `title`, a
+  `description` and a `default` where the job declares them; enums and nested types through `$defs`/`$ref`),
+  `required`, and `additionalProperties: false`. A job declared with names only has untyped properties (`{}`) and
+  every name required, so old jobs still get a plain form.
+- **Definition modules.** Keep task specs and jobs in modules that import no task code, name them in
+  `TASKLINE_CATALOGUE_MODULES` (or pass them to `load_catalogue`), and a web process knows every job without the code
+  that runs it. A module that cannot be imported raises `CatalogueError` naming it. Jobs register with
+  `taskline.catalogue.register(job)`, which returns the job.
+- **`submit_job` refusals for inputs.** `invalid_inputs` carries `problems`, a list of `InputProblem(name, message)`:
+  one for each wrong input, in Pydantic's English message ("Input should be a valid integer…"), "is required and was not
+  given" for a missing one, "is not an input of this job" for an extra one, and the name `(inputs)` for a rule across
+  several inputs. **The refused values are never repeated** in a message. Show the messages next to the fields.
+- **What the job receives** is the model's result: values coerced to the declared types (`"7"` becomes `7`), defaults
+  filled in, everything as JSON. The types live on the job, not on the task functions; a task whose own type hints
+  disagree still fails when it starts.
+- A field with an alias is refused when the job is defined, because a form gives values by field name.
 
 **Test data.** `taskline.testing` writes runs in known states with no worker or Valkey, through the same store
 operations a worker uses, so rows and event logs are what Taskline writes. Synchronous, about 80 ms per run:
@@ -168,7 +200,8 @@ inside an async test.
 
 ## What we need from you
 
-- **Pin** `taskline>=0.2,<0.3`. Until the maintainer has tagged 0.2.0, install from the git repository.
+- **Pin** `taskline>=0.3,<0.4` for typed inputs and the job listing (`>=0.2,<0.3` has the views and commands only).
+  Until a version's tag is pushed, install from the git repository.
 - **Check your environment resolves** with Taskline's dependency ranges (`taskiq>=0.13,<0.14`,
   `taskiq-redis>=1.2,<2`, `taskiq-pipelines>=0.1.4,<0.2`, `redis>=8,<9`, `pydantic>=2,<3`,
   `pydantic-settings>=2,<3`, `sqlalchemy>=2.0`, `psycopg>=3.2`) and tell us if a ceiling conflicts.
@@ -193,7 +226,7 @@ inside an async test.
 | Step | What | You can then |
 |---|---|---|
 | 11 (done) | `cancel_run`, `retry_run`, `requeue`, `submit_job`; **version 0.2.0 prepared** | Build the whole UI against a released version, once tagged |
-| 12 | Job catalogue and typed inputs (`list_jobs()`, JSON Schema); release 0.3.0 | Draw the Run job form |
+| 12 (done) | Job catalogue and typed inputs (`list_jobs()`, JSON Schema); version 0.3.0 | Draw the Run job form |
 | 13 | The scheduler, and the `schedule` view and schedule commands | Build the schedules page |
 
 You can build the read side and the actions now, against the views, the commands and `taskline.testing`.

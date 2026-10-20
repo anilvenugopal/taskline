@@ -22,6 +22,7 @@ class TasklineConfig(BaseSettings):
     lease_intervals: int = 4  # the lease lasts this many heartbeat intervals
     consume_queue: str = "default"  # the queue a worker process reads
     job_modules: str = ""  # comma-separated modules that declare tasks; workers load them
+    catalogue_modules: str = ""  # comma-separated modules that define task specs and jobs, with no task code
     hook_modules: str = ""  # comma-separated modules that register hooks; workers and the reaper load them
     shutdown_wait_seconds: float = 30  # a stopping worker waits this long for running tasks
 

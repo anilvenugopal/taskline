@@ -13,6 +13,7 @@ between calls. Call them from one long-lived event loop and call shutdown() when
 Calling them with a fresh asyncio.run each time also works, but opens new connections every time.
 """
 
+import copy
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
@@ -22,7 +23,8 @@ from typing import Any
 from taskiq import TaskiqMessage
 
 from taskline import catalogue
-from taskline.job import Job
+from taskline.errors import CatalogueError
+from taskline.inputs import InputProblem, check_inputs
 from taskline.runtime import (
     bind_to_running_loop,
     get_broker,
@@ -37,12 +39,17 @@ from taskline.submitting import start_job
 __all__ = [
     "REFUSAL_CODES",
     "CancelResult",
+    "CatalogueError",
     "InputProblem",
+    "JobInfo",
     "Refusal",
     "RequeueResult",
     "RetryResult",
+    "StepInfo",
     "SubmitResult",
     "cancel_run",
+    "list_jobs",
+    "load_catalogue",
     "requeue",
     "retry_run",
     "shutdown",
@@ -72,9 +79,21 @@ class Refusal:
 
 
 @dataclass(frozen=True)
-class InputProblem:
-    name: str  # the job input
-    message: str
+class StepInfo:
+    index: int  # position in the job, from 0, as in the step_index of the views
+    task_name: str
+    queue: str
+
+
+@dataclass(frozen=True)
+class JobInfo:
+    """What a UI needs to offer a job: its name, steps, and the form of its inputs."""
+
+    name: str
+    description: str
+    steps: tuple[StepInfo, ...]
+    required_reference_kinds: tuple[str, ...]  # a submission must give a reference of each kind
+    input_schema: dict[str, Any]  # JSON Schema of the inputs: properties, required, additionalProperties
 
 
 @dataclass(frozen=True)
@@ -193,7 +212,7 @@ async def submit_job(
             "unknown_job", f"no job named {job_name!r} is registered; load the module that defines it"
         )
 
-    problems = _input_problems(job, values)
+    clean, problems = check_inputs(job, values)
     if problems:
         detail = "; ".join(f"{p.name} {p.message}" for p in problems)
         return _refused_submit("invalid_inputs", f"job {job.name!r}: {detail}", tuple(problems))
@@ -221,8 +240,37 @@ async def submit_job(
         correlation_id=correlation_id,
         references=list(references),
     )
-    run_id = await start_job(job, dict(values), submission)
+    run_id = await start_job(job, clean, submission)
     return SubmitResult(True, None, run_id)
+
+
+def list_jobs() -> list[JobInfo]:
+    """Every registered job, by name, with what a UI needs to offer it.
+
+    The schemas are copies, so changing one does not change the job.
+    """
+    return [
+        JobInfo(
+            name=job.name,
+            description=job.description,
+            steps=tuple(
+                StepInfo(index, step.task.name, step.task.queue) for index, step in enumerate(job.steps)
+            ),
+            required_reference_kinds=tuple(sorted(job.required_references())),
+            input_schema=copy.deepcopy(job.input_schema),
+        )
+        for job in catalogue.jobs()
+    ]
+
+
+def load_catalogue(modules: Sequence[str] | str | None = None) -> list[str]:
+    """Import the modules that define jobs, so that importing them registers the jobs.
+
+    Without modules, the ones in TASKLINE_CATALOGUE_MODULES (comma-separated) are loaded. They
+    should define task specs and jobs and import no task code. A module that cannot be imported
+    raises CatalogueError naming it. Returns the modules loaded; loading twice is harmless.
+    """
+    return catalogue.load(modules)
 
 
 async def shutdown() -> None:
@@ -237,16 +285,6 @@ def _check_actor(actor: str) -> None:
 
 def _refused_submit(code: str, message: str, problems: tuple[InputProblem, ...] = ()) -> SubmitResult:
     return SubmitResult(False, Refusal(code, message), None, problems)
-
-
-def _input_problems(job: Job, values: Mapping[str, Any]) -> list[InputProblem]:
-    problems = [
-        InputProblem(name, "is required and was not given") for name in job.inputs if name not in values
-    ]
-    problems += [
-        InputProblem(name, "is not an input of this job") for name in values if name not in job.inputs
-    ]
-    return problems
 
 
 async def _send(resend: list[Resend]) -> list[uuid.UUID]:

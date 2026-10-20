@@ -5,7 +5,8 @@ from typing import Any
 from taskiq.kicker import AsyncKicker
 from taskiq_pipelines import Pipeline
 
-from taskline.errors import MissingInputs, MissingReferences, UnknownInputs
+from taskline.errors import InvalidInputs, MissingInputs, MissingReferences, UnknownInputs
+from taskline.inputs import check_inputs
 from taskline.job import STEP_ARGUMENT, Job
 from taskline.runtime import get_broker, start_runtime
 from taskline.spec import TaskSpec
@@ -39,8 +40,11 @@ async def submit(
 
 
 async def start_job(job: Job, values: dict[str, Any], submission: Submission) -> uuid.UUID:
-    """Check the inputs and references, then send the job's first task."""
-    _check_inputs(job, values)
+    """Check the inputs and references, then send the job's first task.
+
+    What is sent is what the check returns: for a job with a model, the model's validated values.
+    """
+    values = _check_inputs(job, values)
     _check_references(job, submission.references)
 
     await start_runtime()
@@ -59,13 +63,22 @@ def _kicker(broker: Any, spec: TaskSpec) -> AsyncKicker:
     return AsyncKicker(spec.name, broker, spec.labels())
 
 
-def _check_inputs(job: Job, values: dict[str, Any]) -> None:
+def _check_inputs(job: Job, values: dict[str, Any]) -> dict[str, Any]:
+    """The values to send; raises when they do not fit the job's declared inputs."""
+    if job.input_model is not None:
+        clean, problems = check_inputs(job, values)
+        if problems:
+            detail = "; ".join(f"{problem.name} {problem.message}" for problem in problems)
+            raise InvalidInputs(f"job {job.name!r}: {detail}", problems)
+        return clean
+
     missing = [name for name in job.inputs if name not in values]
     if missing:
         raise MissingInputs(f"job {job.name!r} needs the inputs {missing}")
     unknown = [name for name in values if name not in job.inputs]
     if unknown:
         raise UnknownInputs(f"job {job.name!r} does not declare the inputs {unknown}")
+    return dict(values)
 
 
 def _check_references(job: Job, references: Sequence[ReferencePlan]) -> None:
